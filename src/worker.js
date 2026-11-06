@@ -92,7 +92,7 @@ async function handleUpdate(update, env) {
   await tg(env, 'sendChatAction', { chat_id: chatId, action: 'upload_video' });
 
   try {
-    const media = await resolveViaCobalt(url, env);
+    const media = await resolveMedia(url, env);
     await deliverVideo(env, chatId, media, msg.message_id);
   } catch (e) {
     console.error('failed', url, e);
@@ -113,8 +113,124 @@ function cleanInstagramUrl(raw) {
 }
 
 /**
- * Перебираем cobalt-инстансы по очереди, возвращаем первый успешный результат.
+ * Цепочка способов достать mp4. Первый успешный — победил.
+ *   1. Прямой запрос к внутреннему GraphQL Instagram (быстро, без посредников)
+ *   2. Embed-страница Instagram (тоже напрямую)
+ *   3. Внешние cobalt-инстансы
  * @returns {Promise<{url: string, filename?: string}>}
+ */
+async function resolveMedia(url, env) {
+  const shortcode = extractShortcode(url) || (await resolveShareLink(url));
+  const errors = [];
+
+  if (shortcode) {
+    for (const [name, fn] of [
+      ['ig-graphql', igGraphql],
+      ['ig-embed', igEmbed],
+    ]) {
+      try {
+        const media = await fn(shortcode);
+        if (media) return media;
+        errors.push(`${name}: пусто`);
+      } catch (e) {
+        errors.push(`${name}: ${e.message}`);
+      }
+    }
+  } else {
+    errors.push('shortcode не распознан');
+  }
+
+  try {
+    return await resolveViaCobalt(url, env);
+  } catch (e) {
+    errors.push(e.message);
+  }
+  throw new Error(errors.join('; '));
+}
+
+/** /reel/ABC/, /reels/ABC/, /p/ABC/, /tv/ABC/ → ABC */
+function extractShortcode(url) {
+  const m = url.match(/instagram\.com\/(?:[\w.]+\/)?(?:reels?|p|tv)\/([\w-]+)/i);
+  return m ? m[1] : null;
+}
+
+/** Ссылки вида /share/reel/XXXX — это редирект на настоящий /reel/CODE/ */
+async function resolveShareLink(url) {
+  if (!/instagram\.com\/share\//i.test(url)) return null;
+  try {
+    const res = await fetch(url, { redirect: 'manual', headers: { 'User-Agent': UA } });
+    const loc = res.headers.get('location') || '';
+    return extractShortcode(loc);
+  } catch {
+    return null;
+  }
+}
+
+const UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+/** Способ 1: внутренний GraphQL, которым пользуется сайт Instagram. */
+async function igGraphql(shortcode) {
+  const body = new URLSearchParams({
+    variables: JSON.stringify({
+      shortcode,
+      fetch_tagged_user_count: null,
+      hoisted_comment_id: null,
+      hoisted_reply_id: null,
+    }),
+    doc_id: '8845758582119845',
+    lsd: 'AVqbxe3J_YA',
+  });
+
+  const res = await fetch('https://www.instagram.com/api/graphql', {
+    method: 'POST',
+    headers: {
+      'User-Agent': UA,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'X-IG-App-ID': '936619743392459',
+      'X-FB-LSD': 'AVqbxe3J_YA',
+      'X-ASBD-ID': '129477',
+      'Sec-Fetch-Site': 'same-origin',
+      Origin: 'https://www.instagram.com',
+      Referer: `https://www.instagram.com/reel/${shortcode}/`,
+    },
+    body,
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+  const json = await res.json().catch(() => null);
+  const item = json?.data?.xdt_shortcode_media;
+  if (!item) throw new Error('нет данных (логин?)');
+
+  if (item.is_video && item.video_url) {
+    return { url: item.video_url, filename: `${shortcode}.mp4` };
+  }
+  // Карусель — первое видео
+  const child = item.edge_sidecar_to_children?.edges
+    ?.map((e) => e.node)
+    .find((n) => n.is_video && n.video_url);
+  if (child) return { url: child.video_url, filename: `${shortcode}.mp4` };
+
+  throw new Error('в посте нет видео');
+}
+
+/** Способ 2: embed-страница, в её HTML зашит video_url. */
+async function igEmbed(shortcode) {
+  const res = await fetch(`https://www.instagram.com/p/${shortcode}/embed/captioned/`, {
+    headers: { 'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9' },
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const html = await res.text();
+
+  const m = html.match(/"video_url":"([^"]+)"/);
+  if (!m) throw new Error('video_url не найден');
+  // В HTML слэши экранированы: https:\/\/..., и & вместо &
+  const videoUrl = JSON.parse(`"${m[1]}"`);
+  return { url: videoUrl, filename: `${shortcode}.mp4` };
+}
+
+/**
+ * Способ 3: перебираем cobalt-инстансы по очереди.
  */
 async function resolveViaCobalt(url, env) {
   const instances = (env.COBALT_INSTANCES || '')
