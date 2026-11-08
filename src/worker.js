@@ -202,14 +202,20 @@ async function igGraphql(shortcode) {
   const item = json?.data?.xdt_shortcode_media;
   if (!item) throw new Error('нет данных (логин?)');
 
-  if (item.is_video && item.video_url) {
-    return { url: item.video_url, filename: `${shortcode}.mp4` };
-  }
+  const pick = (n) => ({
+    url: n.video_url,
+    filename: `${shortcode}.mp4`,
+    width: n.dimensions?.width,
+    height: n.dimensions?.height,
+  });
+
+  if (item.is_video && item.video_url) return pick(item);
+
   // Карусель — первое видео
   const child = item.edge_sidecar_to_children?.edges
     ?.map((e) => e.node)
     .find((n) => n.is_video && n.video_url);
-  if (child) return { url: child.video_url, filename: `${shortcode}.mp4` };
+  if (child) return pick(child);
 
   throw new Error('в посте нет видео');
 }
@@ -226,7 +232,44 @@ async function igEmbed(shortcode) {
   if (!m) throw new Error('video_url не найден');
   // В HTML слэши экранированы: https:\/\/..., и & вместо &
   const videoUrl = JSON.parse(`"${m[1]}"`);
-  return { url: videoUrl, filename: `${shortcode}.mp4` };
+  const dim = html.match(/"dimensions":\{"height":(\d+),"width":(\d+)\}/);
+  return {
+    url: videoUrl,
+    filename: `${shortcode}.mp4`,
+    height: dim ? Number(dim[1]) : undefined,
+    width: dim ? Number(dim[2]) : undefined,
+  };
+}
+
+/**
+ * Если размеры неизвестны — читаем начало mp4 и достаём их из заголовка (tkhd).
+ * Без этого Telegram иногда считает видео квадратным и сжимает картинку.
+ */
+async function probeDimensions(url) {
+  try {
+    const res = await fetch(url, {
+      headers: { Range: 'bytes=0-2097151', 'User-Agent': 'Mozilla/5.0' },
+    });
+    if (!res.ok) return null;
+    const buf = new Uint8Array(await res.arrayBuffer());
+    const dv = new DataView(buf.buffer);
+
+    // Ищем сигнатуру 'tkhd' и читаем ширину/высоту (fixed 16.16)
+    for (let i = 4; i + 92 < buf.length; i++) {
+      if (buf[i] === 0x74 && buf[i + 1] === 0x6b && buf[i + 2] === 0x68 && buf[i + 3] === 0x64) {
+        const version = buf[i + 4];
+        const off = i + 4 + (version === 1 ? 88 : 76);
+        const width = dv.getUint32(off) >>> 16;
+        const height = dv.getUint32(off + 4) >>> 16;
+        if (width > 0 && height > 0 && width < 10000 && height < 10000) {
+          return { width, height };
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
 }
 
 /**
@@ -316,10 +359,16 @@ async function askCobalt(base, url) {
  * Если не вышло — скачиваем в Worker и загружаем multipart.
  */
 async function deliverVideo(env, chatId, media, replyTo) {
+  if (!media.width || !media.height) {
+    const dim = await probeDimensions(media.url);
+    if (dim) Object.assign(media, dim);
+  }
+
   const common = {
     chat_id: chatId,
     reply_to_message_id: replyTo,
     supports_streaming: true,
+    ...(media.width && media.height ? { width: media.width, height: media.height } : {}),
   };
 
   // Путь 1: по URL
