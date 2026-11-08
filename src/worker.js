@@ -93,12 +93,11 @@ async function handleUpdate(update, env) {
 
   try {
     const media = await resolveMedia(url, env);
-    await deliverVideo(env, chatId, media, msg.message_id);
+    await deliverVideo(env, chatId, media);
   } catch (e) {
     console.error('failed', url, e);
     await tg(env, 'sendMessage', {
       chat_id: chatId,
-      reply_to_message_id: msg.message_id,
       text: `Не получилось: ${e.message ?? e}`,
     });
   }
@@ -358,7 +357,7 @@ async function askCobalt(base, url) {
  * Сначала пробуем самый быстрый путь: Telegram сам скачивает по URL.
  * Если не вышло — скачиваем в Worker и загружаем multipart.
  */
-async function deliverVideo(env, chatId, media, replyTo) {
+async function deliverVideo(env, chatId, media) {
   if (!media.width || !media.height) {
     const dim = await probeDimensions(media.url);
     if (dim) Object.assign(media, dim);
@@ -366,7 +365,6 @@ async function deliverVideo(env, chatId, media, replyTo) {
 
   const common = {
     chat_id: chatId,
-    reply_to_message_id: replyTo,
     supports_streaming: true,
     ...(media.width && media.height ? { width: media.width, height: media.height } : {}),
   };
