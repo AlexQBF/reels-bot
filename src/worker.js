@@ -194,9 +194,15 @@ async function resolveMedia(url, env) {
   const errors = [];
 
   if (shortcode) {
+    const instafixHosts = (env.INSTAFIX_HOSTS || 'www.ddinstagram.com,www.kkinstagram.com')
+      .split(',')
+      .map((h) => h.trim())
+      .filter(Boolean);
+
     for (const [name, fn] of [
       ['ig-graphql', igGraphql],
       ['ig-embed', igEmbed],
+      ...instafixHosts.map((h) => [`instafix:${h.replace(/^www\./, '')}`, (code) => instafix(h, code)]),
     ]) {
       try {
         const media = await fn(shortcode);
@@ -288,6 +294,42 @@ async function igGraphql(shortcode) {
   if (child) return pick(child);
 
   throw new Error('в посте нет видео');
+}
+
+/**
+ * Способ 2б: InstaFix (ddinstagram / kkinstagram) — открытый сервис, который сам ходит в Instagram
+ * и отдаёт прямую ссылку в og:video. OG-теги он показывает только «ботам», поэтому UA — как у Telegram.
+ */
+async function instafix(host, shortcode) {
+  const res = await fetch(`https://${host}/reel/${shortcode}/`, {
+    headers: {
+      'User-Agent': 'TelegramBot (like TwitterBot)',
+      Accept: 'text/html',
+    },
+    redirect: 'follow',
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const html = await res.text();
+
+  const og = (prop) => {
+    const m =
+      html.match(new RegExp(`<meta[^>]+property=["']${prop}["'][^>]+content=["']([^"']+)["']`, 'i')) ||
+      html.match(new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+property=["']${prop}["']`, 'i'));
+    return m ? m[1].replace(/&amp;/g, '&') : null;
+  };
+
+  let videoUrl = og('og:video') || og('og:video:url') || og('og:video:secure_url');
+  if (!videoUrl) throw new Error('нет og:video (отдал только превью)');
+  if (videoUrl.startsWith('/')) videoUrl = `https://${host}${videoUrl}`;
+
+  // Проверяем, что по ссылке действительно видео, а не постер
+  const head = await fetch(videoUrl, { method: 'HEAD', redirect: 'follow', headers: { 'User-Agent': UA } }).catch(() => null);
+  const ctype = head?.headers.get('content-type') || '';
+  if (head && head.ok && /^image\//i.test(ctype)) throw new Error('по ссылке картинка, не видео');
+
+  const w = Number(og('og:video:width')) || undefined;
+  const h = Number(og('og:video:height')) || undefined;
+  return { url: head?.url || videoUrl, filename: `${shortcode}.mp4`, width: w, height: h };
 }
 
 /** Способ 2: embed-страница, в её HTML зашит video_url. */
