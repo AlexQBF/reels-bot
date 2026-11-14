@@ -201,6 +201,7 @@ async function resolveMedia(url, env) {
 
     for (const [name, fn] of [
       ['ig-graphql', igGraphql],
+      ['ig-page', igPage],
       ['ig-embed', igEmbed],
       ...instafixHosts.map((h) => [`instafix:${h.replace(/^www\./, '')}`, (code) => instafix(h, code)]),
     ]) {
@@ -247,53 +248,121 @@ const UA =
 
 /** Способ 1: внутренний GraphQL, которым пользуется сайт Instagram. */
 async function igGraphql(shortcode) {
-  const body = new URLSearchParams({
-    variables: JSON.stringify({
-      shortcode,
-      fetch_tagged_user_count: null,
-      hoisted_comment_id: null,
-      hoisted_reply_id: null,
-    }),
-    doc_id: '8845758582119845',
-    lsd: 'AVqbxe3J_YA',
+  // Два контракта: актуальный «веб» (/graphql/query, PolarisPostActionLoadPostQueryQuery) и старый (/api/graphql).
+  const variables = JSON.stringify({
+    shortcode,
+    fetch_tagged_user_count: null,
+    hoisted_comment_id: null,
+    hoisted_reply_id: null,
   });
-
-  const res = await fetch('https://www.instagram.com/api/graphql', {
-    method: 'POST',
-    headers: {
-      'User-Agent': UA,
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'X-IG-App-ID': '936619743392459',
-      'X-FB-LSD': 'AVqbxe3J_YA',
-      'X-ASBD-ID': '129477',
-      'Sec-Fetch-Site': 'same-origin',
-      Origin: 'https://www.instagram.com',
-      Referer: `https://www.instagram.com/reel/${shortcode}/`,
+  const lsd = 'AVqbxe3J_YA';
+  const attempts = [
+    {
+      url: 'https://www.instagram.com/graphql/query',
+      body: {
+        av: '0',
+        __d: 'www',
+        __user: '0',
+        __a: '1',
+        __req: '3',
+        __comet_req: '7',
+        lsd,
+        jazoest: '2957',
+        fb_api_caller_class: 'RelayModern',
+        fb_api_req_friendly_name: 'PolarisPostActionLoadPostQueryQuery',
+        variables,
+        server_timestamps: 'true',
+        doc_id: '27128499623469141',
+      },
     },
-    body,
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    {
+      url: 'https://www.instagram.com/api/graphql',
+      body: { variables, doc_id: '8845758582119845', lsd },
+    },
+  ];
 
-  const json = await res.json().catch(() => null);
-  const item = json?.data?.xdt_shortcode_media;
-  if (!item) throw new Error('нет данных (логин?)');
+  const errors = [];
+  for (const a of attempts) {
+    try {
+      const res = await fetch(a.url, {
+        method: 'POST',
+        headers: {
+          'User-Agent': UA,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'X-IG-App-ID': '936619743392459',
+          'X-FB-LSD': lsd,
+          'X-FB-Friendly-Name': 'PolarisPostActionLoadPostQueryQuery',
+          'X-ASBD-ID': '129477',
+          'X-CSRFToken': 'missing',
+          Cookie: 'csrftoken=missing; ig_did=0; mid=0; dpr=1',
+          'Sec-Fetch-Site': 'same-origin',
+          'Sec-Fetch-Mode': 'cors',
+          'Sec-Fetch-Dest': 'empty',
+          Accept: '*/*',
+          Origin: 'https://www.instagram.com',
+          Referer: `https://www.instagram.com/reel/${shortcode}/`,
+        },
+        body: new URLSearchParams(a.body),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json().catch(() => null);
+      const item = json?.data?.xdt_shortcode_media;
+      if (!item) throw new Error('нет данных');
+      const media = pickFromShortcodeMedia(item, shortcode);
+      if (media) return media;
+      throw new Error('в посте нет видео');
+    } catch (e) {
+      errors.push(e.message);
+    }
+  }
+  throw new Error(errors.join(' / '));
+}
 
+function pickFromShortcodeMedia(item, shortcode) {
   const pick = (n) => ({
     url: n.video_url,
     filename: `${shortcode}.mp4`,
     width: n.dimensions?.width,
     height: n.dimensions?.height,
   });
-
   if (item.is_video && item.video_url) return pick(item);
+  const child = item.edge_sidecar_to_children?.edges?.map((e) => e.node).find((n) => n.is_video && n.video_url);
+  return child ? pick(child) : null;
+}
 
-  // Карусель — первое видео
-  const child = item.edge_sidecar_to_children?.edges
-    ?.map((e) => e.node)
-    .find((n) => n.is_video && n.video_url);
-  if (child) return pick(child);
+/**
+ * Способ 1б: HTML самой страницы ролика. Instagram вшивает в неё JSON с video_versions
+ * (так видео получает обычный браузер без логина).
+ */
+async function igPage(shortcode) {
+  const res = await fetch(`https://www.instagram.com/reel/${shortcode}/`, {
+    headers: {
+      'User-Agent': UA,
+      Accept: 'text/html,application/xhtml+xml',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Upgrade-Insecure-Requests': '1',
+    },
+    redirect: 'follow',
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const html = await res.text();
+  if (/\/accounts\/login/.test(res.url)) throw new Error('редирект на логин');
 
-  throw new Error('в посте нет видео');
+  // video_versions: [{"width":720,"height":1280,"url":"https:\/\/..."}]
+  const m = html.match(/"video_versions":\s*(\[[^\]]*\])/);
+  if (m) {
+    try {
+      const arr = JSON.parse(m[1]);
+      const best = arr.filter((v) => v.url).sort((a, b) => (b.width || 0) - (a.width || 0))[0];
+      if (best) return { url: best.url, filename: `${shortcode}.mp4`, width: best.width, height: best.height };
+    } catch {}
+  }
+  const m2 = html.match(/"video_url":"([^"]+)"/);
+  if (m2) return { url: JSON.parse(`"${m2[1]}"`), filename: `${shortcode}.mp4` };
+  throw new Error(/login/i.test(html.slice(0, 2000)) ? 'страница требует логин' : 'video_versions не найден');
 }
 
 /**
