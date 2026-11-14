@@ -74,6 +74,21 @@ async function handleUpdate(update, env) {
     return; // чужих молча игнорируем
   }
 
+  // Учёт пользователей (если подключено KV-хранилище USERS)
+  if (env.USERS) {
+    try {
+      await trackUser(env.USERS, msg.from);
+    } catch (e) {
+      console.warn('trackUser failed', e);
+    }
+  }
+
+  const isOwner = env.OWNER_ID && fromId === String(env.OWNER_ID);
+  if (msg.text.startsWith('/stats') && isOwner) {
+    await tg(env, 'sendMessage', { chat_id: chatId, text: await buildStats(env.USERS) });
+    return;
+  }
+
   if (msg.text.startsWith('/start')) {
     await tg(env, 'sendMessage', {
       chat_id: chatId,
@@ -101,6 +116,62 @@ async function handleUpdate(update, env) {
       text: `Не получилось: ${e.message ?? e}`,
     });
   }
+}
+
+/**
+ * Запоминаем пользователя: ключ user:<id>, значение — JSON с датами и счётчиком.
+ * Пишем не чаще раза в час на пользователя, чтобы не упираться в лимит KV (1000 записей/сутки).
+ */
+async function trackUser(kv, from) {
+  if (!from?.id) return;
+  const key = `user:${from.id}`;
+  const now = Date.now();
+  const prev = await kv.get(key, 'json');
+
+  if (prev && now - prev.last < 60 * 60 * 1000) return;
+
+  await kv.put(
+    key,
+    JSON.stringify({
+      first: prev?.first ?? now,
+      last: now,
+      count: (prev?.count ?? 0) + 1,
+      username: from.username ?? null,
+      name: [from.first_name, from.last_name].filter(Boolean).join(' '),
+    }),
+  );
+}
+
+async function buildStats(kv) {
+  if (!kv) return 'KV-хранилище USERS не подключено.';
+  const now = Date.now();
+  const day = 24 * 60 * 60 * 1000;
+  let total = 0;
+  let week = 0;
+  let today = 0;
+  const recent = [];
+  let cursor;
+
+  do {
+    const page = await kv.list({ prefix: 'user:', cursor });
+    for (const k of page.keys) {
+      const u = await kv.get(k.name, 'json');
+      if (!u) continue;
+      total++;
+      if (now - u.last < 7 * day) week++;
+      if (now - u.last < day) today++;
+      recent.push(u);
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+
+  recent.sort((a, b) => b.last - a.last);
+  const list = recent
+    .slice(0, 10)
+    .map((u) => `• ${u.username ? '@' + u.username : u.name || 'без имени'} — ${new Date(u.last).toLocaleDateString('ru-RU')}`)
+    .join('\n');
+
+  return `Всего пользователей: ${total}\nЗа 7 дней: ${week}\nЗа сутки: ${today}\n\nПоследние:\n${list}`;
 }
 
 /** Убираем трекинг-параметры (?igsh=..., utm) — cobalt они не нужны. */
@@ -329,6 +400,10 @@ async function askCobalt(base, url) {
   switch (data.status) {
     case 'tunnel':
     case 'redirect':
+      // cobalt иногда отдаёт обложку (.jpg) вместо видео — это не результат, идём дальше
+      if (/\.(jpe?g|png|webp|heic)(\?|$)/i.test(data.filename || '')) {
+        throw new Error('отдал картинку вместо видео');
+      }
       return { url: data.url, filename: data.filename };
 
     case 'picker': {
@@ -380,6 +455,10 @@ async function deliverVideo(env, chatId, media) {
     cf: { cacheTtl: 0 },
   });
   if (!fileRes.ok) throw new Error(`не скачать файл: HTTP ${fileRes.status}`);
+  const ctype = fileRes.headers.get('content-type') || '';
+  if (/^image\//i.test(ctype)) {
+    throw new Error('источник отдал картинку вместо видео — Instagram не отдаёт этот ролик без логина');
+  }
 
   const len = Number(fileRes.headers.get('content-length') || 0);
   if (len > TG_UPLOAD_LIMIT) {
@@ -393,7 +472,8 @@ async function deliverVideo(env, chatId, media) {
 
   const form = new FormData();
   for (const [k, v] of Object.entries(common)) form.append(k, String(v));
-  form.append('video', new Blob([buf], { type: 'video/mp4' }), media.filename || 'reel.mp4');
+  const fname = (media.filename || 'reel.mp4').replace(/\.[a-z0-9]+$/i, '') + '.mp4';
+  form.append('video', new Blob([buf], { type: 'video/mp4' }), fname);
 
   const up = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendVideo`, {
     method: 'POST',
