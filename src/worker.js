@@ -1,13 +1,18 @@
 /**
  * Instagram Reels → Telegram bot на Cloudflare Workers.
  *
- * Поток: Telegram webhook → Worker → cobalt API (внешний экстрактор)
- *        → прямая ссылка на mp4 → Telegram sendVideo(url).
+ * Поток: Telegram webhook → Worker → поиск прямой ссылки на mp4 (см. resolveMedia)
+ *        → Telegram sendVideo(url).
  * Если Telegram не смог забрать файл по ссылке (>20 МБ, 403 и т.п.),
  * Worker скачивает файл сам и загружает его как multipart (до 50 МБ).
  *
- * Секреты (wrangler secret put ...): BOT_TOKEN, WEBHOOK_SECRET, ALLOWED_USER_ID
- * Переменные (wrangler.toml [vars]): COBALT_INSTANCES — список API-URL через запятую
+ * Секреты (Cloudflare → Settings → Variables and Secrets):
+ *   BOT_TOKEN, WEBHOOK_SECRET — обязательные
+ *   ALLOWED_USER_ID — необязательный: если задан, бот отвечает только этому Telegram ID
+ *   OWNER_ID        — Telegram ID владельца: /stats, недельная сводка, подробные ошибки
+ * Переменные (wrangler.toml [vars]): COBALT_INSTANCES, INSTAFIX_HOSTS, STATS_UTC_OFFSET
+ * Привязка KV (wrangler.toml [[kv_namespaces]]): USERS — статистика пользователей
+ * Расписание (wrangler.toml [triggers]): недельная сводка владельцу
  */
 
 const INSTAGRAM_RE =
@@ -61,6 +66,11 @@ export default {
     ctx.waitUntil(handleUpdate(update, env).catch((e) => console.error('unhandled', e)));
     return new Response('ok');
   },
+
+  // Cron Trigger из wrangler.toml: недельная сводка владельцу
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(sendWeeklyDigest(env).catch((e) => console.error('digest failed', e)));
+  },
 };
 
 async function handleUpdate(update, env) {
@@ -74,22 +84,15 @@ async function handleUpdate(update, env) {
     return; // чужих молча игнорируем
   }
 
-  // Учёт пользователей (если подключено KV-хранилище USERS)
-  if (env.USERS) {
-    try {
-      await trackUser(env.USERS, msg.from);
-    } catch (e) {
-      console.warn('trackUser failed', e);
-    }
-  }
-
-  const isOwner = env.OWNER_ID && fromId === String(env.OWNER_ID);
-  if (msg.text.startsWith('/stats') && isOwner) {
-    await tg(env, 'sendMessage', { chat_id: chatId, text: await buildStats(env.USERS) });
+  const isOwner = Boolean(env.OWNER_ID) && fromId === String(env.OWNER_ID);
+  if (isOwner && /^\/stats(?:@\w+)?(?:\s|$)/.test(msg.text)) {
+    const arg = msg.text.trim().split(/\s+/)[1] || '';
+    await tg(env, 'sendMessage', { chat_id: chatId, text: await buildStats(env, arg) });
     return;
   }
 
   if (msg.text.startsWith('/start')) {
+    await track(env, msg.from, 'seen');
     await tg(env, 'sendMessage', {
       chat_id: chatId,
       text: 'Пришли ссылку на Reels — верну видеофайл.',
@@ -99,6 +102,7 @@ async function handleUpdate(update, env) {
 
   const match = msg.text.match(INSTAGRAM_RE);
   if (!match) {
+    await track(env, msg.from, 'seen');
     await tg(env, 'sendMessage', { chat_id: chatId, text: 'Нужна ссылка на Instagram Reels.' });
     return;
   }
@@ -106,72 +110,237 @@ async function handleUpdate(update, env) {
   const url = cleanInstagramUrl(match[0]);
   await tg(env, 'sendChatAction', { chat_id: chatId, action: 'upload_video' });
 
+  let ok = false;
   try {
     const media = await resolveMedia(url, env);
     await deliverVideo(env, chatId, media);
+    ok = true;
   } catch (e) {
     console.error('failed', url, e);
-    await tg(env, 'sendMessage', {
-      chat_id: chatId,
-      text: `Не получилось: ${e.message ?? e}`,
-    });
+    // Технические подробности — только владельцу (или всем, пока OWNER_ID не задан)
+    const detailed = isOwner || !env.OWNER_ID;
+    await tg(
+      env,
+      'sendMessage',
+      {
+        chat_id: chatId,
+        text: detailed
+          ? `Не получилось: ${e.message ?? e}`
+          : 'Не получилось скачать этот ролик. Попробуйте позже или пришлите другую ссылку.',
+      },
+      { throwOnError: false },
+    );
+  } finally {
+    await track(env, msg.from, ok ? 'ok' : 'fail');
   }
 }
 
-/**
- * Запоминаем пользователя: ключ user:<id>, значение — JSON с датами и счётчиком.
- * Пишем не чаще раза в час на пользователя, чтобы не упираться в лимит KV (1000 записей/сутки).
- */
-async function trackUser(kv, from) {
-  if (!from?.id) return;
+/* ------------------------------------------------------------------ *
+ * Статистика. KV USERS, ключ user:<telegram id>. В записи:
+ *   first/last — первое и последнее обращение; req/ok — запросов на скачивание всего / успешных;
+ *   days — счётчики по дням за последние STATS_KEEP_DAYS суток: { <номер дня>: [запросов, успешных] }.
+ * Копия записи кладётся в metadata ключа: тогда /stats читает всех одним list(),
+ * без отдельного чтения на каждого пользователя (лимит подзапросов на бесплатном тарифе).
+ * На каждую присланную ссылку — одна запись в KV.
+ * ------------------------------------------------------------------ */
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const STATS_KEEP_DAYS = 15;
+const STATS_TOP = 30;
+const LEGACY_READ_LIMIT = 30;
+
+/** Сдвиг от UTC в часах для границ суток. По умолчанию Москва (+3). */
+function tzOffsetMs(env) {
+  const h = Number(env.STATS_UTC_OFFSET ?? 3);
+  return (Number.isFinite(h) ? h : 3) * 60 * 60 * 1000;
+}
+
+function dayIndex(ts, env) {
+  return Math.floor((ts + tzOffsetMs(env)) / DAY_MS);
+}
+
+function fmtDay(idx) {
+  const d = new Date(idx * DAY_MS);
+  return `${String(d.getUTCDate()).padStart(2, '0')}.${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+/** Учёт не должен ломать основную работу: любые ошибки KV только в лог. */
+async function track(env, from, event) {
+  if (!env.USERS || !from?.id) return;
+  try {
+    await trackUser(env, from, event);
+  } catch (e) {
+    console.warn('trackUser failed', e);
+  }
+}
+
+/** event: 'seen' — просто написал боту; 'ok' / 'fail' — прислал ссылку, результат скачивания. */
+async function trackUser(env, from, event) {
+  const kv = env.USERS;
   const key = `user:${from.id}`;
   const now = Date.now();
   const prev = await kv.get(key, 'json');
 
-  if (prev && now - prev.last < 60 * 60 * 1000) return;
+  // «Просто написал» — не чаще раза в час, чтобы не тратить лимит записей KV
+  if (event === 'seen' && prev && now - prev.last < 60 * 60 * 1000) return;
 
-  await kv.put(
-    key,
-    JSON.stringify({
-      first: prev?.first ?? now,
-      last: now,
-      count: (prev?.count ?? 0) + 1,
-      username: from.username ?? null,
-      name: [from.first_name, from.last_name].filter(Boolean).join(' '),
-    }),
-  );
+  const today = dayIndex(now, env);
+  const days = {};
+  for (const [d, v] of Object.entries(prev?.days ?? {})) {
+    if (Number(d) > today - STATS_KEEP_DAYS && Array.isArray(v)) days[d] = v;
+  }
+  const isReq = event === 'ok' || event === 'fail';
+  if (isReq) {
+    const cur = days[today] ?? [0, 0];
+    days[today] = [cur[0] + 1, cur[1] + (event === 'ok' ? 1 : 0)];
+  }
+
+  const rec = {
+    ...(prev ?? {}),
+    id: from.id,
+    first: prev?.first ?? now,
+    last: now,
+    username: from.username ?? null,
+    name: [from.first_name, from.last_name].filter(Boolean).join(' ').slice(0, 64),
+    req: (prev?.req ?? 0) + (isReq ? 1 : 0),
+    ok: (prev?.ok ?? 0) + (event === 'ok' ? 1 : 0),
+    days,
+  };
+
+  // metadata ограничена 1024 байтами
+  let metadata = rec;
+  if (new TextEncoder().encode(JSON.stringify(metadata)).length > 1000) metadata = { ...rec, name: '' };
+  if (new TextEncoder().encode(JSON.stringify(metadata)).length > 1000) metadata = undefined;
+
+  await kv.put(key, JSON.stringify(rec), metadata ? { metadata } : undefined);
 }
 
-async function buildStats(kv) {
-  if (!kv) return 'KV-хранилище USERS не подключено.';
-  const now = Date.now();
-  const day = 24 * 60 * 60 * 1000;
-  let total = 0;
-  let week = 0;
-  let today = 0;
-  const recent = [];
+async function loadUsers(kv) {
+  const users = [];
+  let skipped = 0;
+  let legacyReads = 0;
   let cursor;
-
   do {
     const page = await kv.list({ prefix: 'user:', cursor });
     for (const k of page.keys) {
-      const u = await kv.get(k.name, 'json');
-      if (!u) continue;
-      total++;
-      if (now - u.last < 7 * day) week++;
-      if (now - u.last < day) today++;
-      recent.push(u);
+      let u = k.metadata;
+      if (!u) {
+        // Записи старого формата (без metadata) дочитываем по одной, но не больше лимита
+        if (legacyReads >= LEGACY_READ_LIMIT) {
+          skipped++;
+          continue;
+        }
+        legacyReads++;
+        u = await kv.get(k.name, 'json');
+        if (!u) continue;
+      }
+      users.push({ ...u, id: u.id ?? k.name.slice('user:'.length) });
     }
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
+  return { users, skipped };
+}
 
-  recent.sort((a, b) => b.last - a.last);
-  const list = recent
-    .slice(0, 10)
-    .map((u) => `• ${u.username ? '@' + u.username : u.name || 'без имени'} — ${new Date(u.last).toLocaleDateString('ru-RU')}`)
-    .join('\n');
+function userLabel(u) {
+  if (u.username) return `@${u.username}`;
+  return `${u.name || 'без имени'} (id ${u.id})`;
+}
 
-  return `Всего пользователей: ${total}\nЗа 7 дней: ${week}\nЗа сутки: ${today}\n\nПоследние:\n${list}`;
+/**
+ * /stats        — последние 7 дней, включая сегодня
+ * /stats week   — 7 полных дней до сегодня (то же, что приходит в недельной сводке)
+ * /stats all    — за всё время
+ */
+async function buildStats(env, arg = '') {
+  if (!env.USERS) return 'KV-хранилище USERS не подключено — статистика не ведётся.';
+  const { users, skipped } = await loadUsers(env.USERS);
+  const today = dayIndex(Date.now(), env);
+  const mode = arg.toLowerCase();
+
+  let text;
+  if (mode === 'all') text = reportAllTime(users);
+  else if (mode === 'week') text = reportPeriod(env, users, today - 7, today - 1, 'Сводка за неделю');
+  else text = reportPeriod(env, users, today - 6, today, 'Статистика за 7 дней');
+
+  if (skipped) text += `\n\nНе показано старых записей: ${skipped} (появятся после следующего обращения этих пользователей).`;
+  if (mode !== 'all' && mode !== 'week') text += '\n\n/stats week — прошлые 7 полных дней\n/stats all — за всё время';
+  return text;
+}
+
+function reportPeriod(env, users, fromDay, toDay, title) {
+  const rows = [];
+  let req = 0;
+  let ok = 0;
+  let newcomers = 0;
+  for (const u of users) {
+    let r = 0;
+    let o = 0;
+    for (const [d, v] of Object.entries(u.days ?? {})) {
+      const n = Number(d);
+      if (n >= fromDay && n <= toDay && Array.isArray(v)) {
+        r += v[0] || 0;
+        o += v[1] || 0;
+      }
+    }
+    if (u.first) {
+      const fd = dayIndex(u.first, env);
+      if (fd >= fromDay && fd <= toDay) newcomers++;
+    }
+    if (r > 0) rows.push({ u, r, o });
+    req += r;
+    ok += o;
+  }
+  rows.sort((a, b) => b.r - a.r || (b.u.last ?? 0) - (a.u.last ?? 0));
+
+  const lines = rows.slice(0, STATS_TOP).map(({ u, r, o }, i) => {
+    const fails = r - o;
+    return `${i + 1}. ${userLabel(u)} — ${r}${fails ? ` (не скачалось: ${fails})` : ''}`;
+  });
+  if (rows.length > STATS_TOP) lines.push(`… и ещё пользователей: ${rows.length - STATS_TOP}`);
+
+  const head = `📊 ${title} (${fmtDay(fromDay)}–${fmtDay(toDay)})`;
+  if (!rows.length) {
+    return `${head}\n\nЗапросов на скачивание не было.${newcomers ? `\nНовых пользователей: ${newcomers}` : ''}\nВсего пользователей за всё время: ${users.length}`;
+  }
+  return [
+    head,
+    '',
+    `Скачивали: ${rows.length} чел.`,
+    `Запросов: ${req}, из них успешно: ${ok}`,
+    `Новых пользователей: ${newcomers}`,
+    '',
+    'Кто сколько раз:',
+    ...lines,
+    '',
+    `Всего пользователей за всё время: ${users.length}`,
+  ].join('\n');
+}
+
+function reportAllTime(users) {
+  const rows = users.filter((u) => (u.req ?? 0) > 0).sort((a, b) => b.req - a.req);
+  const req = rows.reduce((n, u) => n + u.req, 0);
+  const ok = rows.reduce((n, u) => n + (u.ok ?? 0), 0);
+  const lines = rows.slice(0, STATS_TOP).map((u, i) => {
+    const fails = u.req - (u.ok ?? 0);
+    return `${i + 1}. ${userLabel(u)} — ${u.req}${fails ? ` (не скачалось: ${fails})` : ''}`;
+  });
+  if (rows.length > STATS_TOP) lines.push(`… и ещё пользователей: ${rows.length - STATS_TOP}`);
+  return [
+    '📊 Статистика за всё время',
+    '',
+    `Всего пользователей: ${users.length}`,
+    `Запросов: ${req}, из них успешно: ${ok}`,
+    ...(lines.length ? ['', 'Кто сколько раз:', ...lines] : []),
+  ].join('\n');
+}
+
+/** Раз в неделю по расписанию: сводка за 7 полных дней — только владельцу. */
+async function sendWeeklyDigest(env) {
+  if (!env.OWNER_ID || !env.USERS) {
+    console.warn('digest skipped: нужны OWNER_ID и привязка USERS');
+    return;
+  }
+  await tg(env, 'sendMessage', { chat_id: String(env.OWNER_ID), text: await buildStats(env, 'week') });
 }
 
 /** Убираем трекинг-параметры (?igsh=..., utm) — cobalt они не нужны. */
@@ -184,10 +353,12 @@ function cleanInstagramUrl(raw) {
 
 /**
  * Цепочка способов достать mp4. Первый успешный — победил.
- *   1. Прямой запрос к внутреннему GraphQL Instagram (быстро, без посредников)
- *   2. Embed-страница Instagram (тоже напрямую)
- *   3. Внешние cobalt-инстансы
- * @returns {Promise<{url: string, filename?: string}>}
+ *   1. ig-web    — анонимная веб-сессия Instagram + GraphQL (как браузер без логина)
+ *   2. ig-page   — HTML страницы ролика
+ *   3. ig-embed  — embed-страница
+ *   4. instafix  — зеркала InstaFix из INSTAFIX_HOSTS
+ *   5. cobalt    — внешние инстансы из COBALT_INSTANCES
+ * @returns {Promise<{url: string, filename?: string, width?: number, height?: number}>}
  */
 async function resolveMedia(url, env) {
   const shortcode = extractShortcode(url) || (await resolveShareLink(url));
@@ -200,7 +371,7 @@ async function resolveMedia(url, env) {
       .filter(Boolean);
 
     for (const [name, fn] of [
-      ['ig-graphql', igGraphql],
+      ['ig-web', igWeb],
       ['ig-page', igPage],
       ['ig-embed', igEmbed],
       ...instafixHosts.map((h) => [`instafix:${h.replace(/^www\./, '')}`, (code) => instafix(h, code)]),
@@ -246,88 +417,231 @@ async function resolveShareLink(url) {
 const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-/** Способ 1: внутренний GraphQL, которым пользуется сайт Instagram. */
-async function igGraphql(shortcode) {
-  // Два контракта: актуальный «веб» (/graphql/query, PolarisPostActionLoadPostQueryQuery) и старый (/api/graphql).
-  const variables = JSON.stringify({
-    shortcode,
-    fetch_tagged_user_count: null,
-    hoisted_comment_id: null,
-    hoisted_reply_id: null,
+/* ------------------------------------------------------------------ *
+ * Способ 1: «как браузер без логина».
+ *
+ * Сайт Instagram для незалогиненного посетителя делает три шага, и мы их повторяем:
+ *   1) открывает главную страницу — получает стартовые cookies и токен LSD;
+ *   2) спрашивает /api/v1/web/get_ruling_for_content/ — доступна ли публикация
+ *      (заодно Instagram выставляет cookie csrftoken);
+ *   3) запрашивает данные публикации через /api/graphql.
+ * Этот путь не зависит от embed-страницы, поэтому подходит и для совместных
+ * публикаций (collab), у которых embed отдаёт только обложку.
+ *
+ * Запросов шага 3 два — их используют актуальные yt-dlp и instaloader (ноябрь 2026).
+ * doc_id меняются Instagram раз в несколько месяцев: если оба запроса начнут
+ * отвечать «нет данных», первым делом сверить doc_id с этими проектами.
+ * ------------------------------------------------------------------ */
+
+const IG_APP_ID = '936619743392459';
+const IG_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+const IG_SESSION_TTL_MS = 10 * 60 * 1000;
+
+/** Анонимная сессия живёт в памяти экземпляра Worker — экономит запросы к Instagram. */
+let igSessionCache = null;
+
+/** Шорткод → числовой id публикации (media_id). */
+function shortcodeToMediaId(shortcode) {
+  // У закрытых публикаций к шорткоду приклеено 28 лишних символов
+  const code = shortcode.length > 28 ? shortcode.slice(0, -28) : shortcode;
+  let n = 0n;
+  for (const ch of code) {
+    const i = IG_ALPHABET.indexOf(ch);
+    if (i < 0) return null;
+    n = n * 64n + BigInt(i);
+  }
+  return n.toString();
+}
+
+function absorbCookies(jar, res) {
+  const list = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+  for (const line of list) {
+    const pair = line.split(';', 1)[0];
+    const eq = pair.indexOf('=');
+    if (eq <= 0) continue;
+    const name = pair.slice(0, eq).trim();
+    const value = pair.slice(eq + 1).trim();
+    if (!value || value === '""' || value === 'deleted') jar.delete(name);
+    else jar.set(name, value);
+  }
+}
+
+function cookieHeader(jar) {
+  return [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+async function igSession() {
+  if (igSessionCache && Date.now() - igSessionCache.at < IG_SESSION_TTL_MS) return igSessionCache;
+
+  const res = await fetch('https://www.instagram.com/', {
+    headers: {
+      'User-Agent': UA,
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Upgrade-Insecure-Requests': '1',
+    },
+    redirect: 'follow',
   });
-  const lsd = 'AVqbxe3J_YA';
-  const attempts = [
+  if (!res.ok) throw new Error(`главная HTTP ${res.status}`);
+  const html = await res.text();
+  const jar = new Map();
+  absorbCookies(jar, res);
+
+  let lsd = null;
+  const eqmc = html.match(/<script\b[^>]*\bid="__eqmc"[^>]*>([^<]+)<\/script>/);
+  if (eqmc) {
+    try {
+      const l = JSON.parse(eqmc[1]).l;
+      if (typeof l === 'string' && l) lsd = l;
+    } catch {}
+  }
+  if (!lsd) lsd = html.match(/"LSD",\[\],\{[^{}]*"token":"([^"]+)"/)?.[1] ?? null;
+  if (!lsd) {
+    throw new Error(/\/accounts\/login/.test(res.url) ? 'главная ведёт на логин' : 'на главной нет токена LSD');
+  }
+  if (!jar.has('csrftoken')) {
+    const csrf = html.match(/"csrf_token":"([^"]+)"/)?.[1];
+    if (csrf) jar.set('csrftoken', csrf);
+  }
+
+  igSessionCache = { at: Date.now(), jar, lsd };
+  return igSessionCache;
+}
+
+function igApiHeaders(session, referer) {
+  const csrf = session.jar.get('csrftoken');
+  return {
+    'User-Agent': UA,
+    Accept: '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'X-IG-App-ID': IG_APP_ID,
+    'X-ASBD-ID': '359341',
+    'X-IG-WWW-Claim': '0',
+    'X-Requested-With': 'XMLHttpRequest',
+    ...(csrf ? { 'X-CSRFToken': csrf } : {}),
+    Origin: 'https://www.instagram.com',
+    Referer: referer,
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Dest': 'empty',
+    ...(session.jar.size ? { Cookie: cookieHeader(session.jar) } : {}),
+  };
+}
+
+async function igWeb(shortcode) {
+  const mediaId = shortcodeToMediaId(shortcode);
+  if (!mediaId) throw new Error('не удалось вычислить media_id');
+
+  let session;
+  try {
+    session = await igSession();
+  } catch (e) {
+    igSessionCache = null;
+    throw e;
+  }
+  const referer = `https://www.instagram.com/reel/${shortcode}/`;
+
+  // Шаг 2: проверка доступности. Ошибка здесь не фатальна — пробуем дальше.
+  let ruling = '';
+  try {
+    const res = await fetch(
+      `https://www.instagram.com/api/v1/web/get_ruling_for_content/?content_type=MEDIA&target_id=${mediaId}`,
+      { headers: igApiHeaders(session, referer) },
+    );
+    absorbCookies(session.jar, res);
+    const json = await res.json().catch(() => null);
+    if (json && json.status !== 'ok') {
+      ruling = [json.title, json.description].filter(Boolean).join(': ');
+    }
+  } catch {}
+
+  const queries = [
     {
-      url: 'https://www.instagram.com/graphql/query',
-      body: {
-        av: '0',
-        __d: 'www',
-        __user: '0',
-        __a: '1',
-        __req: '3',
-        __comet_req: '7',
-        lsd,
-        jazoest: '2957',
-        fb_api_caller_class: 'RelayModern',
-        fb_api_req_friendly_name: 'PolarisPostActionLoadPostQueryQuery',
-        variables,
-        server_timestamps: 'true',
-        doc_id: '27128499623469141',
+      name: 'PolarisLoggedOutDesktopWWWPostRootContentQuery',
+      doc_id: '27130156389949648',
+      variables: { media_id: mediaId },
+      extract: (data) => {
+        const m = data?.xig_polaris_media;
+        return m?.if_not_gated_logged_out ?? (m?.video_versions || m?.carousel_media ? m : null);
       },
     },
     {
-      url: 'https://www.instagram.com/api/graphql',
-      body: { variables, doc_id: '8845758582119845', lsd },
+      name: 'PolarisPostRootQuery',
+      doc_id: '27128499623469141',
+      variables: {
+        shortcode,
+        __relay_internal__pv__PolarisAIGMMediaWebLabelEnabledrelayprovider: false,
+      },
+      extract: (data) => data?.xdt_api__v1__media__shortcode__web_info?.items?.[0] ?? null,
     },
   ];
 
   const errors = [];
-  for (const a of attempts) {
+  for (const [i, q] of queries.entries()) {
     try {
-      const res = await fetch(a.url, {
+      const res = await fetch('https://www.instagram.com/api/graphql', {
         method: 'POST',
         headers: {
-          'User-Agent': UA,
+          ...igApiHeaders(session, referer),
           'Content-Type': 'application/x-www-form-urlencoded',
-          'X-IG-App-ID': '936619743392459',
-          'X-FB-LSD': lsd,
-          'X-FB-Friendly-Name': 'PolarisPostActionLoadPostQueryQuery',
-          'X-ASBD-ID': '129477',
-          'X-CSRFToken': 'missing',
-          Cookie: 'csrftoken=missing; ig_did=0; mid=0; dpr=1',
-          'Sec-Fetch-Site': 'same-origin',
-          'Sec-Fetch-Mode': 'cors',
-          'Sec-Fetch-Dest': 'empty',
-          Accept: '*/*',
-          Origin: 'https://www.instagram.com',
-          Referer: `https://www.instagram.com/reel/${shortcode}/`,
+          'X-FB-LSD': session.lsd,
+          'X-FB-Friendly-Name': q.name,
         },
-        body: new URLSearchParams(a.body),
+        body: new URLSearchParams({
+          av: '0',
+          lsd: session.lsd,
+          fb_api_caller_class: 'RelayModern',
+          fb_api_req_friendly_name: q.name,
+          server_timestamps: 'true',
+          variables: JSON.stringify(q.variables),
+          doc_id: q.doc_id,
+        }),
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = await res.json().catch(() => null);
-      const item = json?.data?.xdt_shortcode_media;
-      if (!item) throw new Error('нет данных');
-      const media = pickFromShortcodeMedia(item, shortcode);
+      absorbCookies(session.jar, res);
+      if (!res.ok) {
+        // Сессию могли забраковать — в следующий раз начнём с чистой
+        if ([401, 403, 429].includes(res.status)) igSessionCache = null;
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const text = await res.text();
+      let json;
+      try {
+        json = JSON.parse(text.replace(/^for\s*\(;;\);/, ''));
+      } catch {
+        throw new Error('ответ не JSON (страница логина?)');
+      }
+      const item = q.extract(json?.data);
+      if (!item) {
+        throw new Error(json?.errors?.[0]?.message ? `ошибка Instagram: ${json.errors[0].message}` : 'нет данных');
+      }
+      const media = pickFromProduct(item, shortcode);
       if (media) return media;
       throw new Error('в посте нет видео');
     } catch (e) {
-      errors.push(e.message);
+      errors.push(`запрос ${i + 1}: ${e.message}`);
     }
   }
+  if (ruling) errors.push(`Instagram: ${ruling}`);
   throw new Error(errors.join(' / '));
 }
 
-function pickFromShortcodeMedia(item, shortcode) {
-  const pick = (n) => ({
-    url: n.video_url,
-    filename: `${shortcode}.mp4`,
-    width: n.dimensions?.width,
-    height: n.dimensions?.height,
-  });
-  if (item.is_video && item.video_url) return pick(item);
-  const child = item.edge_sidecar_to_children?.edges?.map((e) => e.node).find((n) => n.is_video && n.video_url);
-  return child ? pick(child) : null;
+/** Ответ в «мобильном» формате: video_versions у самой публикации или у элементов карусели. */
+function pickFromProduct(item, shortcode) {
+  for (const node of [item, ...(Array.isArray(item.carousel_media) ? item.carousel_media : [])]) {
+    const versions = (node?.video_versions || []).filter((v) => v?.url);
+    if (!versions.length) continue;
+    const best = versions.sort((a, b) => (b.width || 0) * (b.height || 0) - (a.width || 0) * (a.height || 0))[0];
+    return {
+      url: best.url,
+      filename: `${shortcode}.mp4`,
+      width: best.width || node.original_width || undefined,
+      height: best.height || node.original_height || undefined,
+    };
+  }
+  return null;
 }
 
 /**
