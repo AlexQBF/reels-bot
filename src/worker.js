@@ -420,17 +420,6 @@ async function resolveMedia(url, env) {
       } catch (e) {
         if (e.gated) gated = true;
         errors.push(`${name}: ${e.message}`);
-        // Страница ролика указала на другой код той же записи — качаем по нему
-        for (const alt of (e.alts || []).slice(0, 2)) {
-          for (const [altName, altFn] of [['ig-web', igWeb], ['ig-page', igPageOnce]]) {
-            try {
-              const media = await altFn(alt);
-              if (media) return media;
-            } catch (e2) {
-              errors.push(`${altName}→${alt}: ${e2.message}`);
-            }
-          }
-        }
       }
     }
   } else {
@@ -477,16 +466,6 @@ async function diagnose(url, env) {
         lines.push(`${name}: ${media ? fmt(media) : '❌ пусто'}`);
       } catch (e) {
         lines.push(`${name}: ❌ ${e.message}`);
-        for (const alt of (e.alts || []).slice(0, 2)) {
-          for (const [altName, altFn] of [['ig-web', igWeb], ['ig-page', igPageOnce]]) {
-            try {
-              const media = await altFn(alt);
-              lines.push(`  ↳ ${altName} по коду ${alt}: ${media ? fmt(media) : '❌ пусто'}`);
-            } catch (e2) {
-              lines.push(`  ↳ ${altName} по коду ${alt}: ❌ ${e2.message}`);
-            }
-          }
-        }
       }
     }
   }
@@ -874,8 +853,9 @@ async function igPage(shortcode) {
   const alts = new Set();
   const weak = new Map();
 
-  // Адрес бывает и /reel/, и /reels/ — страницы у них разные, пробуем обе
-  for (const path of ['reel', 'reels']) {
+  // Только /reel/ — страница одной публикации. /reels/ — это лента: в её HTML лежат
+  // случайные ролики, брать оттуда видео или «другие коды» нельзя.
+  for (const path of ['reel']) {
     const res = await fetch(`https://www.instagram.com/${path}/${shortcode}/`, {
       headers: {
         'User-Agent': UA,
@@ -902,9 +882,13 @@ async function igPage(shortcode) {
     found.strong.forEach((c) => alts.add(c));
     for (const [c, n] of found.weak) weak.set(c, (weak.get(c) || 0) + n);
 
-    // Если страница на самом деле про другую публикацию, видео из неё брать нельзя —
-    // его достанем отдельным запросом по правильному коду (см. resolveMedia)
+    // Видео берём, только если страница точно про запрошенную публикацию:
+    // не указывает на другой код и содержит наш код в своих данных.
     if (found.strong.length) continue;
+    if (!html.includes(`"${shortcode}"`)) {
+      lastError = 'страница не про этот ролик';
+      continue;
+    }
 
     // video_versions: [{"width":720,"height":1280,"url":"https:\/\/..."}]
     const m = html.match(/"video_versions":\s*(\[[^\]]*\])/);
@@ -923,21 +907,10 @@ async function igPage(shortcode) {
   const weakTop = [...weak].sort((x, y) => y[1] - x[1]).slice(0, 5).map(([c]) => c);
   const err = new Error(
     alts.size
-      ? `страница ведёт на другую публикацию: ${[...alts].join(', ')}`
+      ? `страница указывает на другой код: ${[...alts].join(', ')} (автоматически не используется)`
       : `${lastError}${weakTop.length ? ` (другие коды на странице: ${weakTop.join(', ')})` : ''}`,
   );
-  err.alts = [...alts];
   throw err;
-}
-
-/** То же, но без повторного перехода по «другим кодам» (чтобы не ходить по кругу). */
-async function igPageOnce(shortcode) {
-  try {
-    return await igPage(shortcode);
-  } catch (e) {
-    e.alts = [];
-    throw e;
-  }
 }
 
 /** Числовой id публикации → шорткод. */
@@ -961,8 +934,9 @@ function mediaIdToShortcode(id) {
  * Одна и та же запись иногда имеет несколько кодов (например, рекламная копия поста):
  * по присланному коду Instagram данные не отдаёт, а сайт молча открывает оригинал.
  * strong — куда страница сама себя «переадресует» (редирект, canonical, og:url, al:*:url);
- * weak   — прочие коды, встретившиеся в данных страницы (только для диагностики,
- *          автоматически не используются: это могут быть соседние ролики).
+ * weak   — прочие коды, встретившиеся в данных страницы.
+ * И те и другие только показываются владельцу в тексте ошибки и НЕ используются
+ * для скачивания: проверка показала, что так можно прислать чужой ролик.
  */
 function findAltShortcodes(html, finalUrl, shortcode) {
   const strong = [];
