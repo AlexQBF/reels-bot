@@ -3,13 +3,30 @@ main = "src/worker.js"
 compatibility_date = "2026-10-01"
 
 [vars]
-# API-адреса cobalt-инстансов через запятую. Перебираются по порядку.
-# Проверить живость: см. README. Менять можно в дашборде Cloudflare без редеплоя.
+# Этот файл — источник настроек: при каждом деплое значения [vars] перезаписывают
+# то, что было изменено в панели Cloudflare. Менять переменные нужно здесь.
+# (На секреты это не влияет — они задаются в панели и при деплое сохраняются.)
+
 # Зеркала InstaFix (ddinstagram / kkinstagram): отдают прямую ссылку на видео через og:video.
 INSTAFIX_HOSTS = "www.ddinstagram.com,www.kkinstagram.com"
+# API-адреса cobalt-инстансов через запятую. Перебираются по порядку.
 COBALT_INSTANCES = "https://cobaltapi.squair.xyz,https://cobalt-api.clxxped.lol,https://rue-cobalt.xenon.zone,https://cobaltapi.cjs.nz"
+# Часовой пояс статистики: сдвиг от UTC в часах (3 = Москва).
+STATS_UTC_OFFSET = "3"
 
-# Секреты задаются командой `wrangler secret put <NAME>`:
+# Недельная сводка владельцу. Время в UTC: понедельник 06:00 UTC = 09:00 по Москве.
+[triggers]
+crons = ["0 6 * * 1"]
+
+# Хранилище статистики. Чтобы включить: убрать «#» у трёх строк ниже и вставить
+# ID своего KV-хранилища (Cloudflare → Storage & Databases → KV → нужное хранилище → ID).
+# Строку с ID-заглушкой коммитить нельзя — сборка упадёт.
+[[kv_namespaces]]
+binding = "USERS"
+id = "be96113eb53b45188c7b0320d54b5591"
+
+# Секреты задаются в Cloudflare (Settings → Variables and Secrets, тип Secret):
 #   BOT_TOKEN        — токен от @BotFather
 #   WEBHOOK_SECRET   — любая случайная строка (защита вебхука)
-#   ALLOWED_USER_ID  — ваш Telegram user id (узнать у @userinfobot)
+#   OWNER_ID         — Telegram ID владельца: /stats, недельная сводка, подробные ошибки
+#   ALLOWED_USER_ID  — необязательный: если задан, бот отвечает только этому Telegram ID
