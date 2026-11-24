@@ -11,6 +11,8 @@
  *   ALLOWED_USER_ID — необязательный: если задан, бот отвечает только этому Telegram ID
  *   OWNER_ID        — Telegram ID владельца: /stats, недельная сводка, подробные ошибки,
  *                     уведомления о чужих скачиваниях
+ *   IG_COOKIES      — необязательный: cookies отдельного аккаунта Instagram для роликов,
+ *                     которые Instagram не показывает без входа (см. igAuth)
  * Переменные (wrangler.toml [vars]): COBALT_INSTANCES, INSTAFIX_HOSTS, STATS_UTC_OFFSET
  * Привязка KV (wrangler.toml [[kv_namespaces]]): USERS — статистика пользователей
  * Расписание (wrangler.toml [triggers]): недельная сводка владельцу
@@ -137,9 +139,7 @@ async function handleUpdate(update, env) {
       'sendMessage',
       {
         chat_id: chatId,
-        text: detailed
-          ? `Не получилось: ${e.message ?? e}`
-          : 'Не получилось скачать этот ролик. Попробуйте позже или пришлите другую ссылку.',
+        text: failureText(e, detailed),
       },
       { throwOnError: false },
     );
@@ -147,6 +147,14 @@ async function handleUpdate(update, env) {
     await track(env, msg.from, ok ? 'ok' : 'fail');
     if (!isOwner) await notifyOwner(env, msg.from, url, ok);
   }
+}
+
+function failureText(e, detailed) {
+  const gated = e?.gated
+    ? 'Instagram показывает этот ролик не всем (ограничение по возрасту или стране) и без входа в аккаунт его не отдаёт.'
+    : '';
+  if (detailed) return `${gated ? gated + '\n\n' : ''}Не получилось: ${e?.message ?? e}`;
+  return gated || 'Не получилось скачать этот ролик. Попробуйте позже или пришлите другую ссылку.';
 }
 
 /** Владельцу — сообщение о каждом чужом скачивании: кто и какую ссылку прислал. */
@@ -401,6 +409,7 @@ function cleanInstagramUrl(raw) {
 async function resolveMedia(url, env) {
   const shortcode = extractShortcode(url) || (await resolveShareLink(url));
   const errors = [];
+  let gated = false;
 
   if (shortcode) {
     for (const [name, fn] of directSources(env)) {
@@ -409,7 +418,19 @@ async function resolveMedia(url, env) {
         if (media) return media;
         errors.push(`${name}: пусто`);
       } catch (e) {
+        if (e.gated) gated = true;
         errors.push(`${name}: ${e.message}`);
+        // Страница ролика указала на другой код той же записи — качаем по нему
+        for (const alt of (e.alts || []).slice(0, 2)) {
+          for (const [altName, altFn] of [['ig-web', igWeb], ['ig-page', igPageOnce]]) {
+            try {
+              const media = await altFn(alt);
+              if (media) return media;
+            } catch (e2) {
+              errors.push(`${altName}→${alt}: ${e2.message}`);
+            }
+          }
+        }
       }
     }
   } else {
@@ -421,7 +442,9 @@ async function resolveMedia(url, env) {
   } catch (e) {
     errors.push(e.message);
   }
-  throw new Error(errors.join('; '));
+  const err = new Error(errors.join('; '));
+  err.gated = gated;
+  throw err;
 }
 
 /** Источники, которым достаточно шорткода, в порядке перебора. */
@@ -433,6 +456,8 @@ function directSources(env) {
   return [
     ['ig-web', igWeb],
     ['ig-page', igPage],
+    // Аккаунт задействуем только если анонимные способы не справились — так он меньше «светится»
+    ...(env.IG_COOKIES ? [['ig-auth', (code) => igAuth(code, env)]] : []),
     ['ig-embed', igEmbed],
     ...instafixHosts.map((h) => [`instafix:${h.replace(/^www\./, '')}`, (code) => instafix(h, code)]),
   ];
@@ -452,6 +477,16 @@ async function diagnose(url, env) {
         lines.push(`${name}: ${media ? fmt(media) : '❌ пусто'}`);
       } catch (e) {
         lines.push(`${name}: ❌ ${e.message}`);
+        for (const alt of (e.alts || []).slice(0, 2)) {
+          for (const [altName, altFn] of [['ig-web', igWeb], ['ig-page', igPageOnce]]) {
+            try {
+              const media = await altFn(alt);
+              lines.push(`  ↳ ${altName} по коду ${alt}: ${media ? fmt(media) : '❌ пусто'}`);
+            } catch (e2) {
+              lines.push(`  ↳ ${altName} по коду ${alt}: ❌ ${e2.message}`);
+            }
+          }
+        }
       }
     }
   }
@@ -613,6 +648,7 @@ async function igWeb(shortcode) {
 
   // Шаг 2: проверка доступности. Ошибка здесь не фатальна — пробуем дальше.
   let ruling = '';
+  let gated = false;
   try {
     const res = await fetch(
       `https://www.instagram.com/api/v1/web/get_ruling_for_content/?content_type=MEDIA&target_id=${mediaId}`,
@@ -621,6 +657,7 @@ async function igWeb(shortcode) {
     absorbCookies(session.jar, res);
     const json = await res.json().catch(() => null);
     const verdict = [json?.title, json?.description].filter(Boolean).join(': ');
+    gated = Boolean(verdict); // Instagram сам сообщает, что публикация доступна не всем
     ruling = `проверка доступа: HTTP ${res.status}${json?.status ? `, ${json.status}` : ', не JSON'}${verdict ? ` — ${verdict}` : ''}`;
   } catch (e) {
     ruling = `проверка доступа: ${e.message}`;
@@ -693,6 +730,108 @@ async function igWeb(shortcode) {
     }
   }
   if (ruling) errors.push(ruling);
+  const err = new Error(errors.join(' / '));
+  err.gated = gated;
+  throw err;
+}
+
+/* ------------------------------------------------------------------ *
+ * Способ «с аккаунтом» — работает, только если задан секрет IG_COOKIES
+ * (строка вида "sessionid=...; ds_user_id=...; csrftoken=..." от ОТДЕЛЬНОГО аккаунта).
+ * Нужен для публикаций, которые Instagram не показывает без входа
+ * (ограничение по возрасту/стране). Значение секрета никуда не выводится.
+ * ------------------------------------------------------------------ */
+async function igAuth(shortcode, env) {
+  const jar = new Map();
+  for (const part of String(env.IG_COOKIES).split(';')) {
+    const eq = part.indexOf('=');
+    if (eq > 0) jar.set(part.slice(0, eq).trim(), part.slice(eq + 1).trim());
+  }
+  if (!jar.get('sessionid')) throw new Error('в IG_COOKIES нет sessionid');
+  const mediaId = shortcodeToMediaId(shortcode);
+  if (!mediaId) throw new Error('не удалось вычислить media_id');
+
+  const session = { jar };
+  const referer = `https://www.instagram.com/reel/${shortcode}/`;
+  const errors = [];
+  const isLogin = (res) => {
+    const loc = res.headers.get('location') || '';
+    return (res.status >= 300 && res.status < 400) || /\/accounts\/login|\/challenge\//.test(loc);
+  };
+
+  // 1) тот же запрос, которым залогиненный сайт получает публикацию
+  try {
+    const res = await fetch(`https://www.instagram.com/api/v1/media/${mediaId}/info/`, {
+      headers: igApiHeaders(session, referer),
+      redirect: 'manual',
+    });
+    if (isLogin(res)) throw new Error('Instagram не принял cookies (просит войти заново)');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json().catch(() => null);
+    const item = json?.items?.[0];
+    if (!item) throw new Error('нет данных');
+    const media = pickFromProduct(item, shortcode);
+    if (media) return media;
+    throw new Error('в посте нет видео');
+  } catch (e) {
+    errors.push(`info: ${e.message}`);
+  }
+
+  // 2) запасной путь: GraphQL с токенами со страницы
+  try {
+    const home = await fetch('https://www.instagram.com/', {
+      headers: {
+        'User-Agent': UA,
+        Accept: 'text/html,application/xhtml+xml',
+        'Accept-Language': 'en-US,en;q=0.9',
+        Cookie: cookieHeader(jar),
+      },
+      redirect: 'manual',
+    });
+    if (isLogin(home)) throw new Error('Instagram не принял cookies (просит войти заново)');
+    if (!home.ok) throw new Error(`главная HTTP ${home.status}`);
+    const html = await home.text();
+    const dtsg = html.match(/"DTSGInitialData",\[\],\{[^{}]*"token":"([^"]+)"/)?.[1];
+    const lsd = html.match(/"LSD",\[\],\{[^{}]*"token":"([^"]+)"/)?.[1];
+    if (!dtsg || !lsd) throw new Error('на главной нет токенов (сессия не активна?)');
+
+    const res = await fetch('https://www.instagram.com/api/graphql', {
+      method: 'POST',
+      headers: {
+        ...igApiHeaders(session, referer),
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-FB-LSD': lsd,
+        'X-FB-Friendly-Name': 'PolarisPostRootQuery',
+      },
+      body: new URLSearchParams({
+        av: jar.get('ds_user_id') || '0',
+        fb_dtsg: dtsg,
+        lsd,
+        fb_api_caller_class: 'RelayModern',
+        fb_api_req_friendly_name: 'PolarisPostRootQuery',
+        server_timestamps: 'true',
+        variables: JSON.stringify({
+          shortcode,
+          __relay_internal__pv__PolarisAIGMMediaWebLabelEnabledrelayprovider: false,
+        }),
+        doc_id: '27128499623469141',
+      }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    let json;
+    try {
+      json = JSON.parse((await res.text()).replace(/^for\s*\(;;\);/, ''));
+    } catch {
+      throw new Error('ответ не JSON');
+    }
+    const item = json?.data?.xdt_api__v1__media__shortcode__web_info?.items?.[0];
+    if (!item) throw new Error(describeGraphqlError(json));
+    const media = pickFromProduct(item, shortcode);
+    if (media) return media;
+    throw new Error('в посте нет видео');
+  } catch (e) {
+    errors.push(`graphql: ${e.message}`);
+  }
   throw new Error(errors.join(' / '));
 }
 
@@ -731,34 +870,120 @@ function pickFromProduct(item, shortcode) {
  * (так видео получает обычный браузер без логина).
  */
 async function igPage(shortcode) {
-  const res = await fetch(`https://www.instagram.com/reel/${shortcode}/`, {
-    headers: {
-      'User-Agent': UA,
-      Accept: 'text/html,application/xhtml+xml',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Sec-Fetch-Dest': 'document',
-      'Sec-Fetch-Mode': 'navigate',
-      'Sec-Fetch-Site': 'none',
-      'Upgrade-Insecure-Requests': '1',
-    },
-    redirect: 'follow',
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const html = await res.text();
-  if (/\/accounts\/login/.test(res.url)) throw new Error('редирект на логин');
+  let lastError = 'video_versions не найден';
+  const alts = new Set();
+  const weak = new Map();
 
-  // video_versions: [{"width":720,"height":1280,"url":"https:\/\/..."}]
-  const m = html.match(/"video_versions":\s*(\[[^\]]*\])/);
-  if (m) {
-    try {
-      const arr = JSON.parse(m[1]);
-      const best = arr.filter((v) => v.url).sort((a, b) => (b.width || 0) - (a.width || 0))[0];
-      if (best) return { url: best.url, filename: `${shortcode}.mp4`, width: best.width, height: best.height };
-    } catch {}
+  // Адрес бывает и /reel/, и /reels/ — страницы у них разные, пробуем обе
+  for (const path of ['reel', 'reels']) {
+    const res = await fetch(`https://www.instagram.com/${path}/${shortcode}/`, {
+      headers: {
+        'User-Agent': UA,
+        Accept: 'text/html,application/xhtml+xml',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Upgrade-Insecure-Requests': '1',
+      },
+      redirect: 'follow',
+    });
+    if (!res.ok) {
+      lastError = `HTTP ${res.status}`;
+      continue;
+    }
+    const html = await res.text();
+    if (/\/accounts\/login/.test(res.url)) {
+      lastError = 'редирект на логин';
+      continue;
+    }
+
+    const found = findAltShortcodes(html, res.url, shortcode);
+    found.strong.forEach((c) => alts.add(c));
+    for (const [c, n] of found.weak) weak.set(c, (weak.get(c) || 0) + n);
+
+    // Если страница на самом деле про другую публикацию, видео из неё брать нельзя —
+    // его достанем отдельным запросом по правильному коду (см. resolveMedia)
+    if (found.strong.length) continue;
+
+    // video_versions: [{"width":720,"height":1280,"url":"https:\/\/..."}]
+    const m = html.match(/"video_versions":\s*(\[[^\]]*\])/);
+    if (m) {
+      try {
+        const arr = JSON.parse(m[1]);
+        const best = arr.filter((v) => v.url).sort((x, y) => (y.width || 0) - (x.width || 0))[0];
+        if (best) return { url: best.url, filename: `${shortcode}.mp4`, width: best.width, height: best.height };
+      } catch {}
+    }
+    const m2 = html.match(/"video_url":"([^"]+)"/);
+    if (m2) return { url: JSON.parse(`"${m2[1]}"`), filename: `${shortcode}.mp4` };
+    lastError = /login/i.test(html.slice(0, 2000)) ? 'страница требует логин' : 'video_versions не найден';
   }
-  const m2 = html.match(/"video_url":"([^"]+)"/);
-  if (m2) return { url: JSON.parse(`"${m2[1]}"`), filename: `${shortcode}.mp4` };
-  throw new Error(/login/i.test(html.slice(0, 2000)) ? 'страница требует логин' : 'video_versions не найден');
+
+  const weakTop = [...weak].sort((x, y) => y[1] - x[1]).slice(0, 5).map(([c]) => c);
+  const err = new Error(
+    alts.size
+      ? `страница ведёт на другую публикацию: ${[...alts].join(', ')}`
+      : `${lastError}${weakTop.length ? ` (другие коды на странице: ${weakTop.join(', ')})` : ''}`,
+  );
+  err.alts = [...alts];
+  throw err;
+}
+
+/** То же, но без повторного перехода по «другим кодам» (чтобы не ходить по кругу). */
+async function igPageOnce(shortcode) {
+  try {
+    return await igPage(shortcode);
+  } catch (e) {
+    e.alts = [];
+    throw e;
+  }
+}
+
+/** Числовой id публикации → шорткод. */
+function mediaIdToShortcode(id) {
+  let n;
+  try {
+    n = BigInt(String(id).split('_')[0]);
+  } catch {
+    return null;
+  }
+  if (n <= 0n) return null;
+  let out = '';
+  while (n > 0n) {
+    out = IG_ALPHABET[Number(n % 64n)] + out;
+    n /= 64n;
+  }
+  return out;
+}
+
+/**
+ * Одна и та же запись иногда имеет несколько кодов (например, рекламная копия поста):
+ * по присланному коду Instagram данные не отдаёт, а сайт молча открывает оригинал.
+ * strong — куда страница сама себя «переадресует» (редирект, canonical, og:url, al:*:url);
+ * weak   — прочие коды, встретившиеся в данных страницы (только для диагностики,
+ *          автоматически не используются: это могут быть соседние ролики).
+ */
+function findAltShortcodes(html, finalUrl, shortcode) {
+  const strong = [];
+  const add = (code) => {
+    if (code && code !== shortcode && !strong.includes(code)) strong.push(code);
+  };
+  const fromUrl = (u) => u?.match(/instagram\.com\/(?:[\w.]+\/)?(?:reels?|p|tv)\/([\w-]{5,})/i)?.[1];
+
+  add(fromUrl(finalUrl));
+  const tag = (re) => html.match(re)?.[1]?.replace(/&amp;/g, '&').replace(/\\\//g, '/');
+  add(fromUrl(tag(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i)));
+  add(fromUrl(tag(/<link[^>]+href=["']([^"']+)["'][^>]+rel=["']canonical["']/i)));
+  add(fromUrl(tag(/<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i)));
+  add(fromUrl(tag(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:url["']/i)));
+  for (const m of html.matchAll(/instagram:\/\/media\?id=(\d+)/g)) add(mediaIdToShortcode(m[1]));
+
+  const weak = new Map();
+  for (const m of html.matchAll(/"(?:code|shortcode)":"([\w-]{5,40})"/g)) {
+    if (m[1] !== shortcode && !strong.includes(m[1])) weak.set(m[1], (weak.get(m[1]) || 0) + 1);
+  }
+  return { strong, weak };
 }
 
 /**
