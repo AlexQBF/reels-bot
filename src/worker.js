@@ -9,7 +9,8 @@
  * Секреты (Cloudflare → Settings → Variables and Secrets):
  *   BOT_TOKEN, WEBHOOK_SECRET — обязательные
  *   ALLOWED_USER_ID — необязательный: если задан, бот отвечает только этому Telegram ID
- *   OWNER_ID        — Telegram ID владельца: /stats, недельная сводка, подробные ошибки
+ *   OWNER_ID        — Telegram ID владельца: /stats, недельная сводка, подробные ошибки,
+ *                     уведомления о чужих скачиваниях
  * Переменные (wrangler.toml [vars]): COBALT_INSTANCES, INSTAFIX_HOSTS, STATS_UTC_OFFSET
  * Привязка KV (wrangler.toml [[kv_namespaces]]): USERS — статистика пользователей
  * Расписание (wrangler.toml [triggers]): недельная сводка владельцу
@@ -132,6 +133,31 @@ async function handleUpdate(update, env) {
     );
   } finally {
     await track(env, msg.from, ok ? 'ok' : 'fail');
+    if (!isOwner) await notifyOwner(env, msg.from, url, ok);
+  }
+}
+
+/** Владельцу — сообщение о каждом чужом скачивании: кто и какую ссылку прислал. */
+async function notifyOwner(env, from, url, ok) {
+  if (!env.OWNER_ID || !from?.id) return;
+  const who = userLabel({
+    id: from.id,
+    username: from.username,
+    name: [from.first_name, from.last_name].filter(Boolean).join(' '),
+  });
+  try {
+    await tg(
+      env,
+      'sendMessage',
+      {
+        chat_id: String(env.OWNER_ID),
+        text: `${ok ? '⬇️' : '⚠️'} ${who} ${ok ? 'скачал' : 'не смог скачать'}:\n${url}`,
+        link_preview_options: { is_disabled: true },
+      },
+      { throwOnError: false },
+    );
+  } catch (e) {
+    console.warn('notifyOwner failed', e);
   }
 }
 
