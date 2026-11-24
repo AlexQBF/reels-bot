@@ -92,6 +92,18 @@ async function handleUpdate(update, env) {
     return;
   }
 
+  // /debug <ссылка> — проверить каждый источник по отдельности, видео не отправляется
+  if (isOwner && /^\/debug(?:@\w+)?(?:\s|$)/.test(msg.text)) {
+    const m = msg.text.match(INSTAGRAM_RE);
+    const text = m ? await diagnose(cleanInstagramUrl(m[0]), env) : 'Формат: /debug <ссылка на Reels>';
+    await tg(env, 'sendMessage', {
+      chat_id: chatId,
+      text: text.slice(0, 4000),
+      link_preview_options: { is_disabled: true },
+    });
+    return;
+  }
+
   if (msg.text.startsWith('/start')) {
     await track(env, msg.from, 'seen');
     await tg(env, 'sendMessage', {
@@ -391,17 +403,7 @@ async function resolveMedia(url, env) {
   const errors = [];
 
   if (shortcode) {
-    const instafixHosts = (env.INSTAFIX_HOSTS || 'www.ddinstagram.com,www.kkinstagram.com')
-      .split(',')
-      .map((h) => h.trim())
-      .filter(Boolean);
-
-    for (const [name, fn] of [
-      ['ig-web', igWeb],
-      ['ig-page', igPage],
-      ['ig-embed', igEmbed],
-      ...instafixHosts.map((h) => [`instafix:${h.replace(/^www\./, '')}`, (code) => instafix(h, code)]),
-    ]) {
+    for (const [name, fn] of directSources(env)) {
       try {
         const media = await fn(shortcode);
         if (media) return media;
@@ -420,6 +422,45 @@ async function resolveMedia(url, env) {
     errors.push(e.message);
   }
   throw new Error(errors.join('; '));
+}
+
+/** Источники, которым достаточно шорткода, в порядке перебора. */
+function directSources(env) {
+  const instafixHosts = (env.INSTAFIX_HOSTS || 'www.ddinstagram.com,www.kkinstagram.com')
+    .split(',')
+    .map((h) => h.trim())
+    .filter(Boolean);
+  return [
+    ['ig-web', igWeb],
+    ['ig-page', igPage],
+    ['ig-embed', igEmbed],
+    ...instafixHosts.map((h) => [`instafix:${h.replace(/^www\./, '')}`, (code) => instafix(h, code)]),
+  ];
+}
+
+/** Для /debug: опрашиваем ВСЕ источники (не останавливаясь на первом успехе) и показываем итог по каждому. */
+async function diagnose(url, env) {
+  const shortcode = extractShortcode(url) || (await resolveShareLink(url));
+  const lines = [`🔎 ${url}`, `shortcode: ${shortcode ?? 'не распознан'}`];
+  const fmt = (m) => `✅ видео${m.width && m.height ? ` ${m.width}×${m.height}` : ''}`;
+
+  if (shortcode) {
+    lines.push(`media_id: ${shortcodeToMediaId(shortcode) ?? '—'}`, '');
+    for (const [name, fn] of directSources(env)) {
+      try {
+        const media = await fn(shortcode);
+        lines.push(`${name}: ${media ? fmt(media) : '❌ пусто'}`);
+      } catch (e) {
+        lines.push(`${name}: ❌ ${e.message}`);
+      }
+    }
+  }
+  try {
+    lines.push(`cobalt: ${fmt(await resolveViaCobalt(url, env))}`);
+  } catch (e) {
+    lines.push(`cobalt: ❌ ${e.message}`);
+  }
+  return lines.join('\n');
 }
 
 /** /reel/ABC/, /reels/ABC/, /p/ABC/, /tv/ABC/ → ABC */
@@ -579,10 +620,11 @@ async function igWeb(shortcode) {
     );
     absorbCookies(session.jar, res);
     const json = await res.json().catch(() => null);
-    if (json && json.status !== 'ok') {
-      ruling = [json.title, json.description].filter(Boolean).join(': ');
-    }
-  } catch {}
+    const verdict = [json?.title, json?.description].filter(Boolean).join(': ');
+    ruling = `проверка доступа: HTTP ${res.status}${json?.status ? `, ${json.status}` : ', не JSON'}${verdict ? ` — ${verdict}` : ''}`;
+  } catch (e) {
+    ruling = `проверка доступа: ${e.message}`;
+  }
 
   const queries = [
     {
@@ -641,7 +683,7 @@ async function igWeb(shortcode) {
       }
       const item = q.extract(json?.data);
       if (!item) {
-        throw new Error(json?.errors?.[0]?.message ? `ошибка Instagram: ${json.errors[0].message}` : 'нет данных');
+        throw new Error(describeGraphqlError(json));
       }
       const media = pickFromProduct(item, shortcode);
       if (media) return media;
@@ -650,8 +692,22 @@ async function igWeb(shortcode) {
       errors.push(`запрос ${i + 1}: ${e.message}`);
     }
   }
-  if (ruling) errors.push(`Instagram: ${ruling}`);
+  if (ruling) errors.push(ruling);
   throw new Error(errors.join(' / '));
+}
+
+/** Коротко: что именно Instagram ответил вместо данных публикации. */
+function describeGraphqlError(json) {
+  const err = json?.errors?.[0];
+  if (!err) return json?.data === null ? 'нет данных (data: null)' : 'нет данных';
+  const parts = [];
+  const code = err.code ?? err.extensions?.code;
+  if (code) parts.push(`код ${code}`);
+  if (Array.isArray(err.path) && err.path.length) parts.push(`поле ${err.path.join('.')}`);
+  const extra = [err.summary, err.description].filter((x) => typeof x === 'string' && x).join(' — ');
+  if (extra) parts.push(extra);
+  const msg = String(err.message || 'ошибка').replace(/\s*Check server logs for details\.?/i, '');
+  return `ошибка Instagram: ${msg}${parts.length ? ` (${parts.join('; ')})` : ''}`.slice(0, 300);
 }
 
 /** Ответ в «мобильном» формате: video_versions у самой публикации или у элементов карусели. */
@@ -750,7 +806,10 @@ async function igEmbed(shortcode) {
   const html = await res.text();
 
   const m = html.match(/"video_url":"([^"]+)"/);
-  if (!m) throw new Error('video_url не найден');
+  if (!m) {
+    const hint = embedHint(html);
+    throw new Error(`video_url не найден${hint ? ` — «${hint}»` : ''}`);
+  }
   // В HTML слэши экранированы: https:\/\/..., и & вместо &
   const videoUrl = JSON.parse(`"${m[1]}"`);
   const dim = html.match(/"dimensions":\{"height":(\d+),"width":(\d+)\}/);
@@ -760,6 +819,19 @@ async function igEmbed(shortcode) {
     height: dim ? Number(dim[1]) : undefined,
     width: dim ? Number(dim[2]) : undefined,
   };
+}
+
+/** Если embed не отдал видео, он обычно пишет причину текстом — достаём эту фразу. */
+function embedHint(html) {
+  const text = html
+    .replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&[a-z#0-9]+;/gi, ' ')
+    .replace(/\s+/g, ' ');
+  const m = text.match(
+    /[^.!?]{0,120}\b(?:age|years? old|restricted|unavailable|not available|log ?in|sign ?up|removed|private|broken)\b[^.!?]{0,120}[.!?]?/i,
+  );
+  return m ? m[0].trim().slice(0, 180) : '';
 }
 
 /**
